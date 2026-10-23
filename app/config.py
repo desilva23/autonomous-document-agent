@@ -36,6 +36,9 @@ class Settings:
     max_rate_limit_wait: float = float(os.getenv("LLM_MAX_RATE_LIMIT_WAIT", "2"))
     rate_limit_budget: float = float(os.getenv("LLM_RATE_LIMIT_BUDGET", "120"))
 
+    # Deterministic tools (calculator, calendar) via function calling, plus table/date verification.
+    tools_enabled: bool = os.getenv("AGENT_TOOLS", "true").lower() in ("1", "true", "yes", "on")
+
     # Reflection loop: number of review passes, and the score (1-10) that ends it early.
     review_rounds: int = int(os.getenv("AGENT_REVIEW_ROUNDS", "3"))
     quality_threshold: int = int(os.getenv("AGENT_QUALITY_THRESHOLD", "8"))

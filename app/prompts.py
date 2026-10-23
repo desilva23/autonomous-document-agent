@@ -13,6 +13,22 @@ def _bullets(items: list[str], empty: str = "(none)") -> str:
     return "\n".join(f"- {x}" for x in items) if items else empty
 
 
+# ---------------------------------------------------------------- tools
+
+_TOOL_RULES = """
+TOOLS: you can call calculate, percentage, percent_change, date_add, days_between and project_calendar. \
+Never do arithmetic or date maths in your head:
+- every total, difference, percentage or "X% cheaper/higher" claim: use calculate, percentage or percent_change, \
+passing the RAW input numbers (not subtotals you worked out yourself);
+- every derived date, weekday or week range: use project_calendar (for timelines), date_add or days_between.
+Request all the calls you need in ONE turn, then reply with the JSON object only."""
+
+ANALYZE_TOOLS = _TOOL_RULES + "\nUse them so the fact sheet is exact: milestone dates from project_calendar, budget split and totals from calculate."
+WRITE_TOOLS = _TOOL_RULES
+VERIFIED_NOTE = ("Table totals, percentage shares and weekdays have already been checked and corrected by code, so "
+                 "table arithmetic is right; if a figure in the text disagrees with a table, the text is wrong.")
+
+
 # ---------------------------------------------------------------- 1. analyze
 
 ANALYZE_SYSTEM = """You are the analysis module of an autonomous agent that produces professional business documents \
@@ -183,7 +199,8 @@ Reply with a single JSON object only."""
 
 
 def review_user(request: str, analysis: RequestAnalysis, tasks: list[PlannedTask],
-                sections: dict[str, SectionContent], previous: list[ReviewIssue] | None = None) -> str:
+                sections: dict[str, SectionContent], previous: list[ReviewIssue] | None = None,
+                verified: bool = False) -> str:
     draft = "\n\n".join(
         f"[{t.id}] {t.title} ({t.action})\n{sections[t.id].as_text(max_words=420)}"
         for t in tasks if t.id in sections
@@ -217,6 +234,7 @@ DRAFT:
 Note: the rendered document also has a cover page (title, audience, date, version) and an appendix listing every \
 assumption, conflict decision and open question; do not flag those as missing. The agent's documented decisions are \
 legitimate: flag them only if the draft presents them misleadingly.
+{VERIFIED_NOTE if verified else ""}
 Severity: high = a requirement is missing or a fact is wrong/contradictory; medium = vague, incomplete or likely to \
 confuse the reader; low = polish.
 Score rubric (be consistent): 9-10 no high or medium issues, ready for an executive or client; 7-8 at most two medium \
@@ -226,7 +244,7 @@ Return JSON exactly in this shape:
 {{
   "score": 7,
   "requirements_missing": ["explicit requirement that is not adequately covered"],
-  {prev_shape}"issues": [{{"section_id": "one of: {ids}", "severity": "high, medium or low", "problem": "what is wrong", "fix": "specific instruction to fix it"}}],
+  {prev_shape}"issues": [{{"section_id": "one of: {ids}", "severity": "high, medium or low", "category": "coverage, arithmetic, dates, consistency or clarity", "problem": "what is wrong", "fix": "specific instruction to fix it"}}],
   "new_sections": [{{"title": "...", "action": "write_section or build_table", "instructions": "..."}}],
   "verdict": "pass or revise"
 }}
@@ -245,7 +263,8 @@ Reply with a single JSON object only."""
 
 
 def revise_user(analysis: RequestAnalysis, task: PlannedTask, content: SectionContent,
-                issues: list[ReviewIssue], others: list[tuple[PlannedTask, SectionContent]]) -> str:
+                issues: list[ReviewIssue], others: list[tuple[PlannedTask, SectionContent]],
+                verified: bool = False) -> str:
     context = "\n\n".join(f"### {t.title}\n{c.as_text(max_words=90)}" for t, c in others)
     return f"""DOCUMENT: {analysis.title} — {analysis.document_type} for {analysis.audience}
 {_fact_sheet(analysis)}
@@ -262,6 +281,7 @@ CURRENT CONTENT (JSON):
 
 REVIEWER ISSUES TO FIX:
 {_bullets([f"{i.problem} -> Fix: {i.fix}" for i in issues])}
+{VERIFIED_NOTE if verified else ""}
 
 Return the full rewritten section as JSON in this shape:
 {_SHAPES[task.action]}"""

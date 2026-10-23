@@ -192,6 +192,7 @@ class SectionContent(BaseModel):
 class ReviewIssue(BaseModel):
     section_id: str = "GLOBAL"
     severity: Literal["high", "medium", "low"] = "medium"
+    category: Literal["coverage", "arithmetic", "dates", "consistency", "clarity", "other"] = "other"
     problem: str
     fix: str = ""
     source: Literal["llm", "static"] = "llm"
@@ -201,6 +202,15 @@ class ReviewIssue(BaseModel):
     def _severity(cls, v):
         v = str(v or "").lower()
         return next((s for s in ("high", "medium", "low") if s in v), "medium")
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _category(cls, v):
+        v = str(v or "").lower()
+        aliases = {"math": "arithmetic", "calculation": "arithmetic", "number": "arithmetic", "budget": "arithmetic",
+                   "date": "dates", "timeline": "dates", "schedule": "dates", "requirement": "coverage"}
+        return next((c for c in ("coverage", "arithmetic", "dates", "consistency", "clarity") if c in v),
+                    next((c for k, c in aliases.items() if k in v), "other"))
 
 
 class PreviousIssueCheck(BaseModel):
@@ -271,6 +281,16 @@ class DocumentInfo(BaseModel):
     word_count: int
 
 
+class ChecksInfo(BaseModel):
+    """Deterministic tools and verification (see tools.py, verify.py)."""
+    tools_enabled: bool
+    tool_calls: dict[str, int] = {}
+    first_draft_errors: int = Field(0, description="Arithmetic/date errors found in sections as first written")
+    fact_sheet_errors: int = Field(0, description="Date errors found in the analysis' fact sheet")
+    totals_checked: int = 0
+    corrections: list[str] = Field([], description="Fixes applied by code (table totals, shares, weekdays)")
+
+
 class UsageInfo(BaseModel):
     llm_calls: int
     prompt_tokens: int
@@ -290,5 +310,6 @@ class AgentResponse(BaseModel):
     plan_rationale: str
     todo: list[TodoItem]
     reflection: list[ReviewRound]
+    checks: ChecksInfo
     usage: UsageInfo
     elapsed_s: Annotated[float, Field(description="Wall-clock time for the whole run")]

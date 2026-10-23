@@ -7,6 +7,7 @@ reviews its own draft against the original request, fixes what is weak, and rend
 - **LLM:** Groq free tier, routed by role: `openai/gpt-oss-120b` reasons (analyze, plan, review), `qwen/qwen3.8-27b` writes, `openai/gpt-oss-20b` is the spare. Optional local Ollama fallback.
 - **Stack:** FastAPI · Pydantic v2 · httpx (async) · python-docx
 - **Engineering improvement:** Reflection / self-check: a cross-model quality gate, targeted revision, re-planning, and a regression guard
+- **Second improvement:** Tool calling: the model uses a deterministic calculator and calendar while it writes, and code verifies every table total and date afterwards ([details](#second-improvement-tool-calling-for-exact-numbers-and-dates))
 
 ---
 
@@ -32,6 +33,12 @@ curl -s 'localhost:8000/agent?download=true' -H 'Content-Type: application/json'
   -d '{"request": "Draft an SOP for onboarding new customer-support agents"}' -o sop.docx
 ```
 
+Run the offline tests (no API key or network needed):
+
+```bash
+pip install -r requirements-dev.txt && pytest
+```
+
 Run both assignment test inputs and save the responses and documents into `examples/`:
 
 ```bash
@@ -48,7 +55,7 @@ A run takes about 2–5 minutes. Groq is fast; the free tier's 8k tokens/minute 
 flowchart LR
     R["POST /agent<br/>{request}"] --> A["1. Analyze<br/>doc type · audience<br/>requirements · gaps<br/>conflicts · fact sheet"]
     A --> P["2. Plan<br/>own TODO list<br/>(5-8 tasks, each with<br/>an action)"]
-    P --> E["3. Execute<br/>write_section · build_table<br/>executive_summary last"]
+    P --> E["3. Execute<br/>write_section · build_table<br/>executive_summary last<br/>calculator + calendar tools<br/>code verifies totals and dates"]
     E --> Q{"4. Reflect<br/>reviewer (other model)<br/>+ static checks"}
     Q -- "high/medium issues" --> V["Revise flagged sections<br/>add missing sections<br/>regenerate summary"]
     V --> Q
@@ -59,9 +66,9 @@ flowchart LR
 
 | Step | What the agent decides on its own |
 |---|---|
-| **1. Analyze** | The document type that fits (project plan, board briefing, minutes, SOP…), title, audience, every explicit requirement, what is missing, and which requirements conflict and how to present each conflict. It never stops to ask; it makes explicit, documented assumptions. It also fixes a **fact sheet** (dates, milestones, budget split, named owners for key roles) that every section must reuse, so numbers and names stay consistent. |
+| **1. Analyze** | The document type that fits (project plan, board briefing, minutes, SOP…), title, audience, every explicit requirement, what is missing, and which requirements conflict and how to present each conflict. It never stops to ask; it makes explicit, documented assumptions. It also fixes a **fact sheet** (dates, milestones, budget split, named owners for key roles) that every section must reuse, so numbers and names stay consistent. It computes the fact sheet with the calculator and calendar tools, and code then checks its dates, because every section copies from it. |
 | **2. Plan** | Writes its own TODO list. Each task picks an action: `write_section` (narrative), `build_table` (timelines, budgets, risk registers, RACI…), or `executive_summary`. Every requirement must map to a task (`covers`). The plan is then normalised in code: deduplicated, capped, with exactly one summary. |
-| **3. Execute** | Runs the tasks one by one. **Execution order differs from document order:** the executive summary sits first in the document but runs last, from the finished sections. Each task sees the fact sheet, the conflict decisions, the outline, and digests of what is already written. A table task that comes back without a table is retried on the spot. A failing task doesn't sink the run. |
+| **3. Execute** | Runs the tasks one by one. **Execution order differs from document order:** the executive summary sits first in the document but runs last, from the finished sections. Each task sees the fact sheet, the conflict decisions, the outline, and digests of what is already written. Sections about money, schedules or metrics get the calculator and calendar tools, and every section is verified by code after it is written (see *Second improvement*). A table task that comes back without a table is retried on the spot. A failing task doesn't sink the run. |
 | **4. Reflect** | See below. |
 | **5. Render** | python-docx: cover page, document control table (including the self-review score), contents, numbered sections, executive-summary callout, branded data tables (repeating header rows, right-aligned figures, bold totals), an *Assumptions, Decisions & Open Questions* appendix with a conflict-resolution log, and a header/footer with page X of Y. |
 
@@ -88,7 +95,7 @@ complete but quietly drops a requirement, contradicts itself (a $48k budget in o
 or leaves placeholders. You only find those after sending it. Reflection targets output quality, which is
 what the user actually judges, and it makes that quality measurable.
 
-**How it improves the agent: results from the runs in [`examples/`](examples/).**
+**How it improves the agent: results from the runs in [`examples/`](examples/).** These two runs predate the tool-calling feature.
 
 | Test | Review scores | What the reviewer caught and the agent fixed |
 |---|---|---|
@@ -104,6 +111,73 @@ regressed after revision (8 → 8 → 7) and the guard shipped the best version.
 schema, and invalid JSON is fed back to the model to repair. A 429 never fails a call by itself: the model is
 put on cooldown (Groq's `retry-after`) and the call moves to whichever model frees up first, within a time
 budget. Dead endpoints are dropped.
+
+---
+
+## Second improvement: tool calling for exact numbers and dates
+
+**What I implemented.** Reflection *catches* mistakes after writing. Tools *prevent* the most common ones:
+the model can't do reliable arithmetic or calendar maths, so it doesn't have to.
+
+1. **Deterministic tools** (`app/tools.py`), exposed through native function calling (OpenAI-compatible `tools`):
+
+   | Tool | Use |
+   |---|---|
+   | `calculate(expression)` | Exact arithmetic on a whitelisted AST: numbers, `+ - * / ** %`, `round/sum/min/max/abs`. `eval` is never used. |
+   | `percentage(part, whole)` | Shares, e.g. a cost line as % of the budget |
+   | `percent_change(from, to)` | Every "X% cheaper/higher" claim, phrased for the writer: "50000 is 72.2% lower than 180000" |
+   | `project_calendar(start, weeks)` | Week-by-week dates with weekdays, so week numbers and dates agree |
+   | `date_add`, `days_between` | Derived dates, business days, durations |
+
+   The client (`llm.py`) runs the loop: the model requests tools (several per turn), the client executes them and
+   returns the results, and the model writes its JSON. Groq can't combine JSON mode with tools, so after at most 3
+   tool turns the final turn drops the tools, forces JSON mode and adds a nudge. Tool errors go back to the model
+   as data, never as crashes. Tools are offered only where they pay off: the fact sheet, sections about
+   money, schedules or metrics, the executive summary, and revisions of arithmetic or date issues.
+
+2. **Code verification after every write** (`app/verify.py`), because models skip tools or misuse them:
+   - **Auto-fixed (unambiguous):** plain `Total` / `Subtotal` / `Grand total` rows in money or quantity columns are recomputed in the cell's own format (`€45,000`, `45k`, `$45,000.00`); `% of total` shares are recomputed from the amounts; weekday names that don't match their date ("Wednesday 21 Dec 2026" becomes Monday).
+   - **Flagged to the reviser (ambiguous):** qualified totals such as "Total Committed" may cover a *subset* of rows, so they are never rewritten. They are flagged only if they match neither the rows above, the rows sharing their qualifier, nor all rows. Date ranges that end before they start are flagged too, since code can't know which end is wrong.
+   - The **fact sheet** is checked first, because every section copies from it.
+   - The reviewer is told that table arithmetic has been verified, so if the text contradicts a table, the text is wrong.
+
+**Why.** In the reflection runs, most of the reviewer's catches were arithmetic and dates: a budget that summed
+to €190k against a stated €180k, an ROI of 77.7% that is really 74.05%, a "28% cheaper" that was really 72%,
+milestones ending before they start. Each of those costs a review round to find and a revision to fix,
+and the reviewer only catches some of them.
+
+**Before/after evidence.** [`examples/eval_tools.py`](examples/eval_tools.py) runs each request with tools off (the
+previous agent) and on, and stops after the first review to measure first-draft quality. Code counts the
+errors in each draft in both modes; with tools off it only measures. A third, arithmetic-heavy request
+(a retail business case with a 12-month P&L, break-even and ROI) was added because the assignment inputs are light on
+numbers. Raw results: [`examples/tool_eval.json`](examples/tool_eval.json).
+
+| Request | Tools | Math/date errors in first draft | Errors reaching the reviewer | Reviewer-flagged math/date issues | First-review score | Tool calls | Tokens | Time |
+|---|---|---|---|---|---|---|---|---|
+| standard | off | 0 | 0 | 0 | 8 | 0 | 20k | 46 s |
+| standard | on | 0 | 0 | 0 | 9 | 7 | 39k | 59 s |
+| complex | off | 1 | 1 | 1 (budget summed to €190k vs €180k) | 5 | 0 | 19k | 30 s |
+| complex | on | 2 ¹ | 0 | 1 (a deadline on a public holiday) | 5 | 33 | 83k | 342 s |
+| numbers | off | 2 | 2 | 2 (P&L total mismatch; ROI 77.7% vs 74.05%) | 5 | 0 | 20k | 24 s |
+| numbers | on ² | 0 | 0 | — | — | 21 | 80k | 260 s |
+
+¹ Both were the false correction described below; the redesigned verifier turns that run into 1 flagged issue and no edits.
+² Earlier build, not in `tool_eval.json`: the first draft was measured, but the review was cut off at its token limit (since fixed with a larger review budget and an automatic retry with more tokens). Groq's daily token cap stopped a re-run that day.
+
+**What the evidence says, honestly.**
+- **The deterministic result is clear:** with tools on, no arithmetic or date error reached the reviewer in any run; with tools off, 1–2 did on the requests with real numbers. On the arithmetic-heavy request the writer made 21 tool calls and its first draft had 0 errors, against 2 without tools.
+- **Scores don't show a reliable gain.** One run per cell, and LLM-judge scores swing by up to 4 points between runs of the same request. The reviewer still finds things code can't check, like a deadline on a public holiday.
+- **The cost is real:** 2–4× the tokens, because each tool turn re-sends the prompt. On Groq's free tier (8k tokens/minute per model, plus a daily cap) that means slower runs. Topic-based gating limits it, and `AGENT_TOOLS=false` turns the feature off.
+
+**Found while building it.** Each of these became a fix and a test:
+- **The model mis-added *inside* its own tool call.** gpt-oss-20b passed `(180000 - 55000)` when the items summed to 50,000. Hence the rule "pass raw numbers, never your own subtotals", and code verification as a backstop.
+- **A wrong fact sheet made the reviewer punish correct sections.** The analysis wrote "Wednesday 21 Dec 2026" (a Monday). Code fixed the sections, then the reviewer flagged them for contradicting the fact sheet; that run scored 6, against 8 with tools off. The fact sheet is now verified before anything uses it.
+- **The verifier corrupted a correct-looking table.** It rewrote "Total Committed: 50,000" as the sum of *all* rows (200,000). That's why the auto-fix vs. flag split exists, with this exact table as a regression test. The model's real mistake there was that the committed rows summed to 20,000, and that is now what gets flagged.
+- **Groq-specific failure modes:** "Tool choice is none, but model called a tool" and "Parsing failed" 400s are now retryable bad outputs rather than dead endpoints.
+
+**Tests.** `pytest` runs 21 offline tests in under a second: tools, verifier, the tool loop against a mocked
+Groq API (tool turns, budget nudge, 400 recovery, 429s), and a full agent run with a scripted fake LLM that plants
+the real-world errors above and checks each one is fixed or sent to the reviser.
 
 ---
 
@@ -153,9 +227,11 @@ Response (abridged; full examples in `examples/*_response.json`):
   "plan_rationale": "…",
   "todo": [{ "id": "T3", "title": "Timeline with Milestones", "action": "build_table", "status": "revised", "duration_s": 2.4 }],
   "reflection": [
-    { "round": 1, "score": 5, "verdict": "revise", "issues": [{ "section_id": "T3", "severity": "high", "problem": "…", "fix": "…" }], "revised_sections": ["…"] },
+    { "round": 1, "score": 5, "verdict": "revise", "issues": [{ "section_id": "T3", "severity": "high", "category": "dates", "problem": "…", "fix": "…" }], "revised_sections": ["…"] },
     { "round": 2, "score": 9, "verdict": "pass", "previous_issues_resolved": "6/6", "shipped": true }
   ],
+  "checks": { "tools_enabled": true, "tool_calls": { "calculate": 5, "project_calendar": 2 }, "first_draft_errors": 1, "fact_sheet_errors": 0,
+              "totals_checked": 9, "corrections": ["[T5] 'Total' / 'Cost (€)': €50,000 -> €45,000 (sum of line items)"] },
   "usage": { "llm_calls": 36, "prompt_tokens": 0, "completion_tokens": 0, "retries": 0, "fallbacks": 0, "models_used": {} },
   "elapsed_s": 209.2
 }
@@ -174,10 +250,13 @@ app/
   agent.py          Orchestrator: analyze → plan → execute → reflect/revise → render
   prompts.py        Prompt templates per module (all return strict JSON)
   schemas.py        Pydantic models: API contract + lenient schemas for messy LLM output
-  llm.py            OpenAI-compatible client: JSON mode, self-repair, role routing, rate-limit-aware fallback
+  llm.py            OpenAI-compatible client: JSON mode, tool-calling loop, self-repair, role routing, rate-limit-aware fallback
+  tools.py          Deterministic tools: calculator, percentages, calendar
+  verify.py         Code verification of table totals, shares, weekdays and date ranges
   docx_renderer.py  python-docx styling and layout
   config.py         Settings from .env
-examples/           Test-input runner, saved responses and documents
+tests/              Offline tests (no network): tools, verifier, tool loop, full pipeline with a fake LLM
+examples/           Test-input runner, saved responses and documents, tools before/after evaluation
 outputs/            Generated documents
 ```
 
@@ -193,10 +272,12 @@ outputs/            Generated documents
 | `AGENT_REVIEW_ROUNDS` | `3` | Max review passes |
 | `AGENT_QUALITY_THRESHOLD` | `8` | Score a clean draft needs to pass |
 | `LLM_MAX_RATE_LIMIT_WAIT` | `2` | Seconds to wait for the preferred model before using another |
+| `AGENT_TOOLS` | `true` | Calculator/calendar tool calling and table/date verification |
 
 ## Trade-offs and next steps
 
-- **Free-tier throughput.** A run uses about 20–45k tokens. At 8k tokens/minute per model, routing across three models keeps a run to roughly 2–5 minutes (longer if runs are back to back); on a paid tier the same pipeline finishes in well under a minute. Independent sections could also be written in parallel once rate limits allow.
+- **Tools cost tokens.** Tool turns re-send the prompt, so tools on uses 2–4× the tokens. Gating by topic limits it; a stronger next step is caching the shared prompt prefix or computing the fact sheet's calendar once in code.
+- **Free-tier throughput.** A run uses about 20–45k tokens without tools. At 8k tokens/minute per model, routing across three models keeps a run to roughly 2–5 minutes (longer if runs are back to back); on a paid tier the same pipeline finishes in well under a minute. Independent sections could also be written in parallel once rate limits allow.
 - **Coherence over speed.** Sections are written sequentially so each sees what came before.
 - **LLM judges are noisy.** Scores vary run to run. The anchored re-review, severity rules and regression guard exist because of this, but scores are a signal, not ground truth.
 - **Next:** conversation memory (`session_id`) so a user can say *"make the budget section shorter"* and re-run only that task; streaming progress over SSE; brand templates per company.

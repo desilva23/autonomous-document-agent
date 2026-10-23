@@ -7,6 +7,10 @@ itself. Its engineering improvement is the reflection loop (`_reflect`): a
 reviewer pass scores the draft against the ORIGINAL request, deterministic checks
 catch placeholders and thin sections, and only the flagged sections are rewritten
 (or missing ones added) before the document is rendered.
+
+Prevention complements that detection: the model calls deterministic tools
+(calculator, calendar) while it writes, and `verify.py` recomputes every table
+total and weekday after each write, fixing them in code.
 """
 import logging
 import re
@@ -20,14 +24,19 @@ from .config import settings
 from .docx_renderer import render_document
 from .llm import LLMClient, LLMError, UsageStats
 from .schemas import (
-    AgentResponse, DocumentInfo, NewSection, Plan, PlannedTask, RequestAnalysis, Review,
+    AgentResponse, ChecksInfo, DocumentInfo, NewSection, Plan, PlannedTask, RequestAnalysis, Review,
     ReviewIssue, ReviewRound, SectionContent, TodoItem, UsageInfo,
 )
+from .verify import verify_section, verify_text
 
 log = logging.getLogger("agent")
 
 MAX_TASKS = 9
 MAX_ADDED_SECTIONS = 2
+# Sections about money, figures or schedules get the tools; others skip the extra round trips.
+_NUMERIC_TOPIC = re.compile(r"budget|cost|price|financ|revenue|p&l|profit|margin|roi|break.?even|forecast|saving|"
+                            r"capex|opex|salar|headcount|timeline|schedule|milestone|roadmap|calendar|date|week|"
+                            r"month|quarter|metric|kpi|target|%|percent", re.IGNORECASE)
 _PLACEHOLDER = re.compile(
     r"\[(?:insert|add|tbd|placeholder|your|name|date|company|client)[^\]]*\]|\bTBD\b|\bTBC\b|lorem ipsum|\bXX+\b|\{\{[^}]*\}\}",
     re.IGNORECASE,
@@ -45,6 +54,10 @@ class Run:
     stats: UsageStats = field(default_factory=UsageStats)
     todo: list[TodoItem] = field(default_factory=list)
     started: float = field(default_factory=time.perf_counter)
+    corrections: list[str] = field(default_factory=list)  # fixed by code
+    first_draft_errors: int = 0  # arithmetic/date errors in sections as first written
+    fact_sheet_errors: int = 0  # date errors in the analysis' fact sheet
+    totals_checked: int = 0
 
     def add(self, id: str, title: str, action: str, before: str | None = None) -> TodoItem:
         item = TodoItem(id=id, title=title, action=action)
@@ -77,8 +90,10 @@ class Run:
 
 
 class DocumentAgent:
-    def __init__(self, llm: LLMClient):
+    def __init__(self, llm: LLMClient, tools: bool | None = None, review_rounds: int | None = None):
         self.llm = llm
+        self.tools = settings.tools_enabled if tools is None else tools
+        self.review_rounds = review_rounds or settings.review_rounds
 
     async def run(self, request: str) -> tuple[AgentResponse, str]:
         """Execute the full pipeline. Returns the API response and the generated filename."""
@@ -87,13 +102,15 @@ class DocumentAgent:
 
         # 1. Understand the request and resolve gaps/conflicts up front.
         with run.track(run.add("S1", "Understand request: type, audience, gaps, conflicts", "analyze")) as item:
-            analysis = await self.llm.json(prompts.ANALYZE_SYSTEM, prompts.analyze_user(request),
-                                           RequestAnalysis, run.stats, prefer=settings.reasoning_model,
-                                           temperature=0.2, max_tokens=2500, effort="medium")
+            analysis = await self.llm.json(self._sys(prompts.ANALYZE_SYSTEM, prompts.ANALYZE_TOOLS),
+                                           prompts.analyze_user(request), RequestAnalysis, run.stats,
+                                           prefer=settings.reasoning_model, temperature=0.2, max_tokens=2500,
+                                           effort="medium", tools=self.tools)
             item.detail = (f"{analysis.document_type}; {len(analysis.assumptions)} assumptions, "
                            f"{len(analysis.conflicts)} conflicts")
         if not analysis.in_scope:
             raise OutOfScopeError(analysis.out_of_scope_reason or "This request cannot be served by a business document.")
+        analysis = self._verify_facts(run, analysis)
 
         # 2. Plan: the agent writes its own TODO list.
         with run.track(run.add("S2", "Create execution plan (TODO list)", "plan")) as item:
@@ -122,7 +139,9 @@ class DocumentAgent:
         # 5. Render.
         with run.track(run.item("S4")) as item:
             filename = f"{_slug(analysis.title)}_{datetime.now():%Y%m%d_%H%M%S}.docx"
-            render_document(analysis, plan.tasks, sections, rounds, settings.output_dir / filename)
+            verification = (f"{run.totals_checked} table figure(s) recomputed by code, {len(run.corrections)} corrected; "
+                            f"{sum(run.stats.tool_calls.values())} calculator/calendar tool call(s)") if self.tools else ""
+            render_document(analysis, plan.tasks, sections, rounds, settings.output_dir / filename, verification)
             item.detail = filename
 
         return self._response(run, analysis, plan, sections, rounds, filename), filename
@@ -155,15 +174,58 @@ class DocumentAgent:
 
     # ------------------------------------------------------------ execution
 
+    def _sys(self, system: str, tool_rules: str, tools: bool | None = None) -> str:
+        return system + "\n" + tool_rules if (self.tools if tools is None else tools) else system
+
+    def _needs_tools(self, task: PlannedTask, issues: list[ReviewIssue] = ()) -> bool:
+        if not self.tools:
+            return False
+        if task.action == "executive_summary" or any(i.category in ("arithmetic", "dates") for i in issues):
+            return True
+        return bool(_NUMERIC_TOPIC.search(" ".join([task.title, task.instructions, *task.covers])))
+
+    def _verify(self, run: Run, task: PlannedTask, content: SectionContent, first_draft: bool) -> SectionContent:
+        """Recompute table totals/shares and weekdays. With tools off this only measures, it never edits."""
+        v = verify_section(content, fix=self.tools)
+        run.totals_checked += v.totals_checked
+        if first_draft:
+            run.first_draft_errors += len(v.corrections) + len(v.issues)
+        for c in v.corrections:
+            log.info("    🧮 [%s] %s %s", task.id, "fixed" if self.tools else "found (not fixed, tools off)", c)
+        if not self.tools:
+            return content
+        run.corrections += [f"[{task.id}] {c}" for c in v.corrections]
+        return v.content
+
+    def _verify_facts(self, run: Run, analysis: RequestAnalysis) -> RequestAnalysis:
+        """The fact sheet is every section's source of truth, so its dates are checked before anything uses them."""
+        def check(text: str) -> str:
+            fixed, corrections, issues = verify_text(text, fix=self.tools)
+            run.fact_sheet_errors += len(corrections) + len(issues)
+            for c in corrections + issues:
+                log.info("    🧮 [fact sheet] %s %s", "fixed" if self.tools and c in corrections else "found", c)
+            if self.tools:
+                run.corrections += [f"[fact sheet] {c}" for c in corrections]
+            return fixed if self.tools else text
+
+        analysis.key_facts = [check(f) for f in analysis.key_facts]
+        analysis.assumptions = [check(a) for a in analysis.assumptions]
+        for c in analysis.conflicts:
+            c.resolution = check(c.resolution)
+        return analysis
+
     async def _execute(self, run: Run, analysis: RequestAnalysis, plan: Plan, task: PlannedTask,
-                       sections: dict[str, SectionContent], extra: str = "") -> bool:
+                       sections: dict[str, SectionContent], extra: str = "", first_draft: bool = True) -> bool:
         try:
+            use_tools = self._needs_tools(task)
             with run.track(run.item(task.id)) as item:
                 for attempt in range(2):
                     content = await self.llm.json(
-                        prompts.WRITE_SYSTEM.format(document_type=analysis.document_type, audience=analysis.audience),
+                        self._sys(prompts.WRITE_SYSTEM.format(document_type=analysis.document_type,
+                                                              audience=analysis.audience), prompts.WRITE_TOOLS, use_tools),
                         prompts.section_user(run.request, analysis, plan.tasks, task, sections, extra),
                         SectionContent, run.stats, prefer=settings.writer_model, temperature=0.6, max_tokens=1500,
+                        tools=use_tools,
                     )
                     if task.action != "build_table" or (content.table and len(content.table.rows) >= 2) or attempt:
                         break
@@ -171,6 +233,7 @@ class DocumentAgent:
                     log.warning("  [%s] reply had no usable table — retrying once", task.id)
                     extra += ("\nIMPORTANT: your previous reply had no usable table. The table object is mandatory: "
                               "give columns and 4-10 complete rows.")
+                content = self._verify(run, task, content, first_draft)
                 sections[task.id] = content
                 item.detail = f"{content.word_count()} words" + (f", table {len(content.table.rows)} rows" if content.table else "")
             return True
@@ -185,14 +248,14 @@ class DocumentAgent:
         rounds: list[ReviewRound] = []
         best: tuple[ReviewRound, dict[str, SectionContent], list[PlannedTask]] | None = None
         added = 0
-        for n in range(1, settings.review_rounds + 1):
-            static = _static_checks(plan.tasks, sections)
+        for n in range(1, self.review_rounds + 1):
+            static = _static_checks(plan.tasks, sections, dates=self.tools)
             try:
                 previous = [i for i in rounds[-1].issues if i.source == "llm"] if rounds else None
                 review = await self.llm.json(
                     prompts.REVIEW_SYSTEM,
-                    prompts.review_user(run.request, analysis, plan.tasks, sections, previous),
-                    Review, run.stats, prefer=settings.reasoning_model, temperature=0.1, max_tokens=2500,
+                    prompts.review_user(run.request, analysis, plan.tasks, sections, previous, verified=self.tools),
+                    Review, run.stats, prefer=settings.reasoning_model, temperature=0.1, max_tokens=4000,
                     effort="medium",
                 )
             except LLMError:
@@ -223,7 +286,7 @@ class DocumentAgent:
                     review.score >= 9 or (review.score >= settings.quality_threshold and not serious)):
                 rnd.verdict = "pass"
                 break
-            if n == settings.review_rounds or not (serious or new_sections):
+            if n == self.review_rounds or not (serious or new_sections):
                 rnd.verdict = "accepted"  # out of budget or nothing actionable: ship the best version
                 break
             rnd.revised_sections, rnd.added_sections = await self._revise(
@@ -259,17 +322,21 @@ class DocumentAgent:
             if not task_issues:
                 continue
             if task.id not in sections:  # failed earlier: retry from scratch
-                if await self._execute(run, analysis, plan, task, sections):
+                if await self._execute(run, analysis, plan, task, sections, first_draft=False):
                     revised.append(task.title)
                 continue
             log.info("  ✎ revising [%s] %s (%d issues)", task.id, task.title, len(task_issues))
             try:
+                use_tools = self._needs_tools(task, task_issues)
                 new = await self.llm.json(
-                    prompts.REVISE_SYSTEM,
+                    self._sys(prompts.REVISE_SYSTEM, prompts.WRITE_TOOLS, use_tools),
                     prompts.revise_user(analysis, task, sections[task.id], task_issues,
-                                        [(t, sections[t.id]) for t in plan.tasks[1:] if t.id in sections and t is not task]),
+                                        [(t, sections[t.id]) for t in plan.tasks[1:] if t.id in sections and t is not task],
+                                        verified=self.tools),
                     SectionContent, run.stats, prefer=settings.writer_model, temperature=0.4, max_tokens=1500,
+                    tools=use_tools,
                 )
+                new = self._verify(run, task, new, first_draft=False)
                 if reason := _regression(task, sections[task.id], new):
                     log.warning("  ✗ revision of [%s] %s; keeping the previous version", task.id, reason)
                     continue
@@ -289,14 +356,14 @@ class DocumentAgent:
             plan.tasks.append(task)
             run.add(task.id, task.title, task.action, before="S3")
             log.info("  ＋ re-plan: added [%s] %s", task.id, task.title)
-            if await self._execute(run, analysis, plan, task, sections):
+            if await self._execute(run, analysis, plan, task, sections, first_draft=False):
                 added.append(task.title)
 
         # The summary must reflect the revised body, so regenerate it whenever anything changed.
         summary_issues = by_task.get(summary.id, []) + by_task.get("GLOBAL", [])
         if revised or added or summary_issues:
             notes = _bullets_text(summary_issues)
-            if await self._execute(run, analysis, plan, summary, sections,
+            if await self._execute(run, analysis, plan, summary, sections, first_draft=False,
                                    extra=f"Reviewer notes to address:\n{notes}" if notes else ""):
                 run.item(summary.id).status = "revised"
                 revised.append(summary.title)
@@ -339,6 +406,9 @@ class DocumentAgent:
             plan_rationale=plan.rationale,
             todo=run.todo,
             reflection=rounds,
+            checks=ChecksInfo(tools_enabled=self.tools, tool_calls=s.tool_calls, first_draft_errors=run.first_draft_errors,
+                              fact_sheet_errors=run.fact_sheet_errors,
+                              totals_checked=run.totals_checked, corrections=run.corrections),
             usage=UsageInfo(llm_calls=s.calls, prompt_tokens=s.prompt_tokens, completion_tokens=s.completion_tokens,
                             retries=s.retries, fallbacks=s.fallbacks, models_used=s.models_used),
             elapsed_s=round(time.perf_counter() - run.started, 1),
@@ -347,7 +417,8 @@ class DocumentAgent:
 
 # ---------------------------------------------------------------- helpers
 
-def _static_checks(tasks: list[PlannedTask], sections: dict[str, SectionContent]) -> list[ReviewIssue]:
+def _static_checks(tasks: list[PlannedTask], sections: dict[str, SectionContent],
+                   dates: bool = False) -> list[ReviewIssue]:
     """Deterministic checks the LLM reviewer tends to miss."""
     issues = []
     for t in tasks:
@@ -367,6 +438,10 @@ def _static_checks(tasks: list[PlannedTask], sections: dict[str, SectionContent]
             issues.append(ReviewIssue(section_id=t.id, source="static", severity="high",
                                       problem=f"Section is too thin ({c.word_count()} words).",
                                       fix="Expand with specific detail, figures and owners."))
+        if dates:  # what code can't fix safely (impossible dates, ambiguous totals) goes to the reviser
+            for category, problem in verify_section(c, fix=False).issues:
+                issues.append(ReviewIssue(section_id=t.id, source="static", severity="high", category=category,
+                                          problem=problem, fix="Recompute with the calculator and calendar tools."))
     return issues
 
 

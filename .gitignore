@@ -2,3 +2,4 @@
 __pycache__/
 .env
 outputs/*.docx
+.pytest_cache/

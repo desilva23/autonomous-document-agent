@@ -40,7 +40,7 @@ _TCPR_ORDER = ["tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd", "noWra
 
 
 def render_document(analysis: RequestAnalysis, tasks: list[PlannedTask], sections: dict[str, SectionContent],
-                    rounds: list[ReviewRound], path: Path) -> Path:
+                    rounds: list[ReviewRound], path: Path, verification: str = "") -> Path:
     doc = Document()
     _page_setup(doc)
     _styles(doc)
@@ -50,7 +50,7 @@ def render_document(analysis: RequestAnalysis, tasks: list[PlannedTask], section
     headings = [t.title for t, _ in ordered] + (["Assumptions, Decisions & Open Questions"] if has_appendix else [])
 
     _cover(doc, analysis)
-    _control_and_contents(doc, analysis, headings, rounds)
+    _control_and_contents(doc, analysis, headings, rounds, verification)
 
     tables = itertools.count(1)
     for n, (task, content) in enumerate(ordered, 1):
@@ -338,7 +338,8 @@ def _cover(doc, a: RequestAnalysis):
     doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
 
-def _control_and_contents(doc, a: RequestAnalysis, headings: list[str], rounds: list[ReviewRound]):
+def _control_and_contents(doc, a: RequestAnalysis, headings: list[str], rounds: list[ReviewRound],
+                          verification: str = ""):
     doc.add_heading("Document Control", level=2)
     quality = "Not reviewed"
     if rounds:
@@ -348,7 +349,7 @@ def _control_and_contents(doc, a: RequestAnalysis, headings: list[str], rounds: 
                    f"(scores {' → '.join(f'{r.score}' for r in rounds)}; {revised} section revision{'s' * (revised != 1)})")
     rows = (("Document", a.title), ("Type", a.document_type), ("Audience", a.audience),
             ("Objective", a.objective or "—"), ("Status", "Draft v1.0 — for stakeholder review"),
-            ("Quality gate", quality))
+            ("Quality gate", quality)) + ((("Verification", verification),) if verification else ())
     t = doc.add_table(rows=0, cols=2)
     for label, value in rows:
         cells = t.add_row().cells

@@ -1,0 +1,100 @@
+[
+  {
+    "request": "standard",
+    "rep": 1,
+    "tools": false,
+    "first_review_score": 8,
+    "first_draft_errors": 0,
+    "errors_reaching_review": 0,
+    "reviewer_math_date": 0,
+    "reviewer_math_date_examples": [],
+    "date_order_issues": 0,
+    "corrections_by_code": [],
+    "tool_calls": {},
+    "tokens": 20161,
+    "elapsed_s": 45.7
+  },
+  {
+    "request": "complex",
+    "rep": 1,
+    "tools": false,
+    "first_review_score": 5,
+    "first_draft_errors": 1,
+    "errors_reaching_review": 1,
+    "reviewer_math_date": 1,
+    "reviewer_math_date_examples": [
+      "The cost breakdown adds up incorrectly: €30k (GDPR) + €20k (EU AI Act) + €40k (Infrastructure) + €90k (Hiring) + €10k (Other) = €190k, but the total proposed budget is stated as €180k. The table also "
+    ],
+    "date_order_issues": 0,
+    "corrections_by_code": [],
+    "tool_calls": {},
+    "tokens": 18919,
+    "elapsed_s": 30.3
+  },
+  {
+    "request": "numbers",
+    "rep": 1,
+    "tools": false,
+    "first_review_score": 5,
+    "first_draft_errors": 2,
+    "errors_reaching_review": 2,
+    "reviewer_math_date": 2,
+    "reviewer_math_date_examples": [
+      "The P&L table shows a cumulative net profit of €384,862.50 at Month 12, but the text in T4 and T5 claims €419,856 and €441,000 respectively. The table's cumulative sum is also internally inconsistent ",
+      "The stated First-Year ROI of ~77.7% is mathematically incorrect based on the provided figures. Net Profit (€419,850) / Total Investment (€567,000) = 74.05%. The 77.7% figure likely derives from an inc"
+    ],
+    "date_order_issues": 0,
+    "corrections_by_code": [],
+    "tool_calls": {},
+    "tokens": 19585,
+    "elapsed_s": 23.8
+  },
+  {
+    "request": "standard",
+    "rep": 1,
+    "tools": true,
+    "first_review_score": 9,
+    "first_draft_errors": 0,
+    "fact_sheet_errors": 0,
+    "errors_reaching_review": 0,
+    "reviewer_math_date": 0,
+    "reviewer_math_date_examples": [],
+    "date_order_issues": 0,
+    "corrections_by_code": [],
+    "tool_calls": {
+      "project_calendar": 2,
+      "calculate": 2,
+      "percentage": 3
+    },
+    "tokens": 39195,
+    "elapsed_s": 59.4
+  },
+  {
+    "request": "complex",
+    "rep": 1,
+    "tools": true,
+    "first_review_score": 5,
+    "first_draft_errors": 2,
+    "fact_sheet_errors": 0,
+    "errors_reaching_review": 0,
+    "reviewer_math_date": 1,
+    "reviewer_math_date_examples": [
+      "The target completion date for 'GDPR Data Minimization Review' is listed as 2027-01-01, which is a holiday and potentially an unrealistic operational deadline for a final audit. While not strictly a f"
+    ],
+    "date_order_issues": 0,
+    "corrections_by_code": [
+      "[T3] 'Total Committed' / 'Allocated (€)': 50000 -> 200000 (sum of line items)",
+      "[T3] 'Total Committed' / '% of €200k': 25.0% -> 100.0% (sum of line items)"
+    ],
+    "tool_calls": {
+      "date_add": 14,
+      "project_calendar": 3,
+      "percentage": 3,
+      "days_between": 2,
+      "percent_change": 9,
+      "calculate": 2
+    },
+    "tokens": 83064,
+    "elapsed_s": 342.2
+  }
+]

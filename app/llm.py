@@ -1,6 +1,11 @@
 """OpenAI-compatible JSON chat client with retry, self-repair and model fallback.
 
 Every agent module asks for a JSON object validated against a Pydantic schema.
+Calls made with tools=True run a native function-calling loop first: the model may
+request deterministic tools (calculator, calendar; see tools.py), the client runs
+them and returns the results, and the model then writes its JSON answer. Groq can't
+combine JSON mode with tools, so if that answer isn't valid JSON, the next attempt
+drops the tools and forces JSON mode with the tool results still in context.
 Invalid JSON is fed back to the model to fix; 5xx/timeouts back off; an endpoint
 that keeps failing is dropped for that call. A 429 never fails a call by itself:
 the endpoint is put on cooldown (provider retry-after) and the call either waits
@@ -19,9 +24,13 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from .config import settings
+from .tools import TOOL_SPECS, run_tool
 
 log = logging.getLogger("agent.llm")
 T = TypeVar("T", bound=BaseModel)
+MAX_TOOL_TURNS = 3
+_FINAL_NUDGE = {"role": "user", "content": "You now have every tool result you need. Do not call any more tools: "
+                                           "reply with the final JSON object only."}
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,7 @@ class UsageStats:
     retries: int = 0
     fallbacks: int = 0
     models_used: dict[str, int] = field(default_factory=dict)
+    tool_calls: dict[str, int] = field(default_factory=dict)
 
 
 class LLMError(RuntimeError):
@@ -117,12 +127,14 @@ class LLMClient:
         temperature: float = 0.4,
         max_tokens: int = 2048,
         effort: str | None = None,
+        tools: bool = False,
     ) -> T:
         if not self.endpoints:
             raise LLMError("No LLM configured. Set GROQ_API_KEY in .env (free key at console.groq.com).")
 
-        base = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        messages, temp = base, temperature
+        convo = [{"role": "system", "content": system}, {"role": "user", "content": user}]  # + tool exchanges
+        repair: list[dict] = []  # latest self-repair turn, replaced on each retry
+        temp, tool_turns, force_json = temperature, 0, False
         failures: dict[str, int] = {}  # endpoint -> failed attempts (rate limits don't count)
         dead: set[str] = set()
         errors: list[str] = []
@@ -142,8 +154,20 @@ class LLMClient:
             last = ep.name
 
             raw = ""
+            use_tools = tools and not force_json and tool_turns < MAX_TOOL_TURNS
+            nudge = [_FINAL_NUDGE] if tool_turns and not use_tools else []
             try:
-                raw = await self._chat(ep, messages, temp, max_tokens, effort, stats)
+                msg = await self._chat(ep, convo + nudge + repair, temp, max_tokens, effort, stats, use_tools)
+                if msg.get("tool_calls"):
+                    convo = convo + [{"role": "assistant", "content": msg.get("content") or "",
+                                      "tool_calls": msg["tool_calls"]}]
+                    for i, call in enumerate(msg["tool_calls"]):
+                        call.setdefault("id", f"call_{tool_turns}_{i}")
+                        convo.append({"role": "tool", "tool_call_id": call["id"], "content": self._run_tool(call, stats)})
+                    tool_turns += 1
+                    repair = []
+                    continue
+                raw = msg.get("content") or ""
                 result = schema.model_validate(_extract_json(raw))
                 if ep.model != prefer:
                     stats.fallbacks += 1
@@ -158,14 +182,17 @@ class LLMClient:
                 errors.append(f"{ep.name}: invalid output ({_short(e)})")
                 log.warning("  %s gave invalid output: %s", ep.name, _short(e))
                 # Self-repair: show the model its own output and the validation error.
-                messages = base
+                repair = []
                 if raw and not isinstance(e, _BadOutput):
-                    messages = base + [
+                    repair = [
                         {"role": "assistant", "content": raw[:6000]},
                         {"role": "user", "content": f"That reply did not match the required JSON schema: "
                                                     f"{_short(e)}. Reply with ONLY the corrected JSON object."},
                     ]
                 temp = max(0.1, temp - 0.2)
+                force_json = True  # retry in JSON mode (no tools); tool results stay in context
+                if "cut off" in str(e):
+                    max_tokens = min(int(max_tokens * 1.6), 8000)
             except _Transient as e:
                 errors.append(f"{ep.name}: {e}")
                 log.warning("  %s transient error (%s), backing off", ep.name, e)
@@ -181,14 +208,39 @@ class LLMClient:
             if failures[ep.name] >= settings.max_attempts:
                 dead.add(ep.name)
 
-    async def _chat(self, ep: Endpoint, messages, temperature, max_tokens, effort, stats: UsageStats) -> str:
+    def _run_tool(self, call: dict, stats: UsageStats) -> str:
+        name = call.get("function", {}).get("name", "")
+        try:
+            args = json.loads(call["function"].get("arguments") or "{}")
+            if not isinstance(args, dict):
+                args, result = {}, {"error": "arguments must be a JSON object"}
+            else:
+                result = run_tool(name, args)
+        except (KeyError, TypeError, json.JSONDecodeError) as e:
+            args, result = {}, {"error": f"invalid arguments: {e}"}
+        stats.tool_calls[name] = stats.tool_calls.get(name, 0) + 1
+        if "error" in result or "summary" in result or "result" in result:
+            shown = result.get("error", result.get("summary", result.get("result")))
+        elif isinstance(result.get("weeks"), list):
+            shown = f"{len(result['weeks'])} weeks, ends {result['end']}"
+        else:
+            shown = result
+        log.info("    🔧 %s(%s) → %s", name, ", ".join(f"{v}" for v in args.values())[:70], str(shown)[:90])
+        return json.dumps(result)
+
+    async def _chat(self, ep: Endpoint, messages, temperature, max_tokens, effort, stats: UsageStats,
+                    use_tools: bool = False) -> dict:
         payload = {
             "model": ep.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
         }
+        if use_tools:
+            payload["tools"] = TOOL_SPECS
+            payload["tool_choice"] = "auto"
+        else:
+            payload["response_format"] = {"type": "json_object"}
         if ep.model.startswith("openai/gpt-oss"):
             payload["reasoning_effort"] = effort or settings.reasoning_effort
         headers = {"Authorization": f"Bearer {ep.api_key}"} if ep.api_key else {}
@@ -204,8 +256,10 @@ class LLMClient:
             raise _RateLimited(_retry_after(r))
         if r.status_code >= 500:
             raise _Transient(f"HTTP {r.status_code}")
-        if r.status_code == 400 and "json_validate_failed" in r.text:
-            raise _BadOutput("provider rejected malformed JSON")
+        if r.status_code == 400 and "tool_use_failed" in r.text and "ool choice is none" in r.text:
+            raise _BadOutput("model tried to call a tool after its tool budget was spent")
+        if r.status_code == 400 and ("json_validate_failed" in r.text or "failed_generation" in r.text):
+            raise _BadOutput("provider could not parse the model's output")
         if r.status_code >= 400:
             raise _EndpointDown(f"HTTP {r.status_code}: {r.text[:200]}")
 
@@ -217,7 +271,7 @@ class LLMClient:
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
             raise _BadOutput("reply was cut off at the token limit; be more concise")
-        return choice["message"].get("content") or ""
+        return choice["message"]
 
 
 def _extract_json(raw: str):
