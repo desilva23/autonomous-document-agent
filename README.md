@@ -174,8 +174,9 @@ numbers. Raw results: [`examples/tool_eval.json`](examples/tool_eval.json).
 - **A wrong fact sheet made the reviewer punish correct sections.** The analysis wrote "Wednesday 21 Dec 2026" (a Monday). Code fixed the sections, then the reviewer flagged them for contradicting the fact sheet; that run scored 6, against 8 with tools off. The fact sheet is now verified before anything uses it.
 - **The verifier corrupted a correct-looking table.** It rewrote "Total Committed: 50,000" as the sum of *all* rows (200,000). That's why the auto-fix vs. flag split exists, with this exact table as a regression test. The model's real mistake there was that the committed rows summed to 20,000, and that is now what gets flagged.
 - **Groq-specific failure modes:** "Tool choice is none, but model called a tool" and "Parsing failed" 400s are now retryable bad outputs rather than dead endpoints.
+- **Quota exhaustion produced an empty document.** A live run with the daily token cap nearly spent returned HTTP 200 with a 0-section document, because every task failed instantly. Now the client raises a dedicated rate-limit error, the agent aborts the first draft, and the API returns `503` with a `Retry-After` header and a plain message ("try again in about 10 minutes").
 
-**Tests.** `pytest` runs 21 offline tests in under a second: tools, verifier, the tool loop against a mocked
+**Tests.** `pytest` runs 24 offline tests in under a second: tools, verifier, the tool loop against a mocked
 Groq API (tool turns, budget nudge, 400 recovery, 429s), and a full agent run with a scripted fake LLM that plants
 the real-world errors above and checks each one is fixed or sent to the reviser.
 
@@ -237,7 +238,7 @@ Response (abridged; full examples in `examples/*_response.json`):
 }
 ```
 
-Errors: `422` for invalid or out-of-scope requests (guardrail), `502` if every LLM endpoint fails.
+Errors: `422` for invalid or out-of-scope requests (guardrail), `503` with a `Retry-After` header when the free-tier quota is exhausted, `502` if every LLM endpoint fails for another reason.
 Other endpoints: `GET /documents/{filename}`, `GET /health` (shows the active model chain).
 
 ---

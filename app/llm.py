@@ -60,6 +60,14 @@ class LLMError(RuntimeError):
     """Every endpoint in the chain failed."""
 
 
+class RateLimitedError(LLMError):
+    """Only rate limits stood in the way, and they outlast the time budget (e.g. a daily token cap)."""
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class _RateLimited(Exception):
     def __init__(self, wait: float):
         super().__init__(f"rate limited, retry in {wait:.1f}s")
@@ -144,8 +152,11 @@ class LLMClient:
 
         while True:
             ep, wait = self._pick(prefer, dead)
-            if ep is None or time.monotonic() + wait > deadline:
-                raise LLMError("All LLM endpoints failed: " + "; ".join(errors[-4:] or ["rate-limit budget exhausted"]))
+            if ep is None:
+                raise LLMError("All LLM endpoints failed: " + "; ".join(errors[-4:]))
+            if time.monotonic() + wait > deadline:
+                raise RateLimitedError(f"All models are rate limited; the soonest frees up in {wait:.0f}s "
+                                       f"({ep.name})", retry_after=wait)
             if wait > 0:
                 log.warning("  waiting %.1fs for %s rate limit", wait, ep.name)
                 await asyncio.sleep(wait)

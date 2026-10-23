@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 
 from .agent import DocumentAgent, OutOfScopeError
 from .config import settings
-from .llm import LLMClient, LLMError, build_endpoints
+from .llm import LLMClient, LLMError, RateLimitedError, build_endpoints
 from .schemas import AgentRequest, AgentResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
@@ -79,6 +79,12 @@ async def run_agent(
         result, filename = await request.app.state.agent.run(body.request)
     except OutOfScopeError as e:
         raise HTTPException(status_code=422, detail={"status": "rejected", "reason": str(e)})
+    except RateLimitedError as e:
+        minutes = max(1, round(e.retry_after / 60))
+        log.error("Rate limited for %.0fs: %s", e.retry_after, e)
+        raise HTTPException(status_code=503, headers={"Retry-After": str(int(e.retry_after) + 1)}, detail={
+            "status": "unavailable", "retry_after_s": int(e.retry_after) + 1,
+            "reason": f"The free-tier LLM quota is exhausted for now. Try again in about {minutes} minute(s)."})
     except LLMError as e:
         log.error("LLM failure: %s", e)
         raise HTTPException(status_code=502, detail={"status": "error", "reason": str(e)})

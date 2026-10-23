@@ -12,6 +12,7 @@ import pytest
 
 from app import agent as agent_module
 from app.agent import DocumentAgent
+from app.llm import RateLimitedError
 from app.schemas import Plan, PlannedTask, RequestAnalysis, Review, ReviewIssue, SectionContent
 
 FILLER = " ".join(["The plan is specific, owned and dated."] * 14)  # ~90 words, passes the thin-section check
@@ -96,3 +97,32 @@ def test_tools_off_measures_but_changes_nothing(outdir):
     assert resp.checks.corrections == [] and resp.checks.first_draft_errors >= 2
     assert "Go-live: Wednesday 21 Dec 2026" in resp.analysis.key_facts
     assert not any(i.source == "static" and i.category == "dates" for i in resp.reflection[0].issues)
+
+
+class QuotaGoneLLM(FakeLLM):
+    async def json(self, system, user, schema, stats, **kw):
+        if schema is SectionContent:
+            raise RateLimitedError("All models are rate limited", retry_after=626)
+        return await super().json(system, user, schema, stats, **kw)
+
+
+def test_exhausted_quota_aborts_instead_of_rendering_an_empty_document(outdir):
+    with pytest.raises(RateLimitedError):
+        asyncio.run(DocumentAgent(QuotaGoneLLM(), tools=True).run("Plan our helpdesk migration"))
+    assert list(outdir.iterdir()) == []
+
+
+def test_api_returns_503_with_retry_after(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    class Agent:
+        async def run(self, request):
+            raise RateLimitedError("All models are rate limited", retry_after=626)
+
+    with TestClient(app) as client:
+        app.state.agent = Agent()
+        r = client.post("/agent", json={"request": "Create a project plan for our helpdesk migration"})
+    assert r.status_code == 503 and r.headers["retry-after"] == "627"
+    assert "about 10 minute(s)" in r.json()["detail"]["reason"]

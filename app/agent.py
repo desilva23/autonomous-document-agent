@@ -22,7 +22,7 @@ from datetime import datetime
 from . import prompts
 from .config import settings
 from .docx_renderer import render_document
-from .llm import LLMClient, LLMError, UsageStats
+from .llm import LLMClient, LLMError, RateLimitedError, UsageStats
 from .schemas import (
     AgentResponse, ChecksInfo, DocumentInfo, NewSection, Plan, PlannedTask, RequestAnalysis, Review,
     ReviewIssue, ReviewRound, SectionContent, TodoItem, UsageInfo,
@@ -237,6 +237,11 @@ class DocumentAgent:
                 sections[task.id] = content
                 item.detail = f"{content.word_count()} words" + (f", table {len(content.table.rows)} rows" if content.table else "")
             return True
+        except RateLimitedError:
+            if first_draft:  # quota is gone: abort with a clear error instead of rendering empty sections
+                raise
+            log.error("  Task %s hit the rate limit; keeping the current version", task.id)
+            return False
         except LLMError:
             log.error("  Task %s failed; continuing with the rest of the plan", task.id)
             return False

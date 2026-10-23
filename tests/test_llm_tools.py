@@ -5,7 +5,9 @@ import json
 import httpx
 from pydantic import BaseModel
 
-from app.llm import _FINAL_NUDGE, Endpoint, LLMClient, UsageStats
+import pytest
+
+from app.llm import _FINAL_NUDGE, Endpoint, LLMClient, RateLimitedError, UsageStats
 
 
 class Total(BaseModel):
@@ -78,3 +80,14 @@ def test_malformed_tool_calls_are_answered_with_errors():
     tool_msgs = [m for m in requests[1]["messages"] if m["role"] == "tool"]
     assert result.total == 3 and len(tool_msgs) == 2
     assert all("error" in json.loads(m["content"]) for m in tool_msgs)
+
+
+def test_quota_exhaustion_raises_rate_limited_error_with_retry_after():
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "tokens per day"}}, headers={"retry-after": "626"})
+
+    client = LLMClient([Endpoint("groq", "test-model", "http://groq.test", "key")])
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(RateLimitedError) as err:
+        asyncio.run(client.json("Reply with JSON.", "hi", Total, UsageStats()))
+    assert 620 < err.value.retry_after <= 626
