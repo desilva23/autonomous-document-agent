@@ -145,6 +145,16 @@ class SectionContent(BaseModel):
     bullets: list[str] = []
     table: TableData | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _alternative_keys(cls, data):
+        # Models sometimes put the prose under another key; an empty section is worse than a renamed one.
+        if isinstance(data, dict) and not data.get("paragraphs"):
+            for key in ("content", "text", "summary", "body", "section", "paragraph"):
+                if data.get(key):
+                    return {**data, "paragraphs": data[key]}
+        return data
+
     @field_validator("paragraphs", mode="before")
     @classmethod
     def _paragraphs(cls, v):

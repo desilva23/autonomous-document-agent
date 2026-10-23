@@ -139,8 +139,9 @@ class DocumentAgent:
         # 5. Render.
         with run.track(run.item("S4")) as item:
             filename = f"{_slug(analysis.title)}_{datetime.now():%Y%m%d_%H%M%S}.docx"
-            verification = (f"{run.totals_checked} table figure(s) recomputed by code, {len(run.corrections)} corrected; "
-                            f"{sum(run.stats.tool_calls.values())} calculator/calendar tool call(s)") if self.tools else ""
+            verification = (f"{sum(run.stats.tool_calls.values())} calculator/calendar tool call(s); "
+                            f"{run.totals_checked} table total(s) checked by code; "
+                            f"{len(run.corrections)} fix(es) applied by code") if self.tools else ""
             render_document(analysis, plan.tasks, sections, rounds, settings.output_dir / filename, verification)
             item.detail = filename
 
@@ -227,13 +228,24 @@ class DocumentAgent:
                         SectionContent, run.stats, prefer=settings.writer_model, temperature=0.6, max_tokens=1500,
                         tools=use_tools,
                     )
-                    if task.action != "build_table" or (content.table and len(content.table.rows) >= 2) or attempt:
+                    # Cheap inline checks: an empty reply, or a table section without a table, is retried now.
+                    if content.word_count() < 20 and not content.table:
+                        problem = "your previous reply contained no text. Write the full section"
+                    elif task.action == "build_table" and not (content.table and len(content.table.rows) >= 2):
+                        problem = "your previous reply had no usable table. The table object is mandatory: give columns and 4-10 complete rows"
+                    elif task.action == "executive_summary" and not content.bullets:
+                        problem = "your previous reply had no key points. Include 3-5 bullets, each with a concrete figure or date"
+                    else:
                         break
-                    # Cheap inline check: a table section without a table is retried now, not after review.
-                    log.warning("  [%s] reply had no usable table — retrying once", task.id)
-                    extra += ("\nIMPORTANT: your previous reply had no usable table. The table object is mandatory: "
-                              "give columns and 4-10 complete rows.")
+                    if attempt:
+                        break
+                    log.warning("  [%s] %s — retrying once", task.id, problem.split(".")[0].replace("your previous reply", "reply"))
+                    extra += f"\nIMPORTANT: {problem}."
                 content = self._verify(run, task, content, first_draft)
+                if (old := sections.get(task.id)) and (reason := _regression(task, old, content)):
+                    log.warning("  ✗ new version of [%s] %s; keeping the previous version", task.id, reason)
+                    item.detail = f"kept previous version ({reason})"
+                    return False
                 sections[task.id] = content
                 item.detail = f"{content.word_count()} words" + (f", table {len(content.table.rows)} rows" if content.table else "")
             return True
@@ -301,8 +313,11 @@ class DocumentAgent:
         # Never ship a regression: if a revision made things clearly worse, restore the best reviewed version.
         # Judge scores wobble by about a point, so a 1-point dip alone doesn't undo real fixes.
         final, top = rounds[-1], best[0]
-        new_high = any(i.severity == "high" for i in final.issues) and not any(i.severity == "high" for i in top.issues)
-        if top is not final and (top.score - final.score >= 2 or (top.score > final.score and new_high)):
+        def highs(r: ReviewRound) -> int:
+            return sum(i.severity == "high" for i in r.issues)
+
+        new_high = highs(final) > highs(top)  # e.g. a revision emptied a section
+        if top is not final and (top.score - final.score >= 2 or (top.score >= final.score and new_high)):
             log.warning("  ↺ round %d scored %d/10, below round %d (%d/10): shipping the round %d version",
                         rounds[-1].round, rounds[-1].score, best[0].round, best[0].score, best[0].round)
             sections.clear()

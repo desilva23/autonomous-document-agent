@@ -126,3 +126,46 @@ def test_api_returns_503_with_retry_after(monkeypatch):
         r = client.post("/agent", json={"request": "Create a project plan for our helpdesk migration"})
     assert r.status_code == 503 and r.headers["retry-after"] == "627"
     assert "about 10 minute(s)" in r.json()["detail"]["reason"]
+
+
+class EmptySummaryRegenLLM(FakeLLM):
+    """Regression: a live run's summary regeneration came back as valid JSON with 0 words and was shipped."""
+
+    async def json(self, system, user, schema, stats, **kw):
+        if schema is SectionContent and "Reviewer notes" in user or (
+                schema is SectionContent and self.reviews and 'section 1. "Executive Summary"' in user):
+            self.calls.append(("SectionContent", "Executive Summary (regen)", bool(kw.get("tools"))))
+            return SectionContent()
+        return await super().json(system, user, schema, stats, **kw)
+
+
+def test_empty_regeneration_keeps_the_previous_version(outdir):
+    llm = EmptySummaryRegenLLM()
+    resp, _ = asyncio.run(DocumentAgent(llm, tools=True, review_rounds=3).run("Plan our helpdesk migration"))
+    regens = [c for c in llm.calls if c[1] == "Executive Summary (regen)"]
+    assert len(regens) == 2  # empty reply retried once on the spot, then rejected
+    assert resp.key_points == ["Budget: €45,000"]  # the original summary survived
+    assert next(t for t in resp.todo if t.id == "T1").status != "revised"
+
+
+class TieWithNewHighIssueLLM(FakeLLM):
+    async def json(self, system, user, schema, stats, **kw):
+        if schema is SectionContent and '"Timeline & Milestones"' in user:  # start clean: no planted date error
+            return SectionContent(paragraphs=[FILLER], table={"columns": ["Phase", "Start date", "End date"], "rows": [
+                ["Kick-off", "2 Nov 2026", "13 Nov 2026"], ["Go-live", "21 Dec 2026", "21 Dec 2026"]]})
+        if schema is Review:
+            self.reviews += 1
+            if self.reviews == 1:
+                return Review(score=7, issues=[ReviewIssue(section_id="T4", severity="medium", problem="Vague scope",
+                                                           fix="Be specific")])
+            return Review(score=7, previous_issues=[{"number": 1, "resolved": True}],
+                          issues=[ReviewIssue(section_id="T2", severity="high", problem="Budget contradicts the scope",
+                                              fix="Align")])
+        return await super().json(system, user, schema, stats, **kw)
+
+
+def test_tie_with_a_new_high_issue_rolls_back_to_the_earlier_version(outdir):
+    resp, _ = asyncio.run(DocumentAgent(TieWithNewHighIssueLLM(), tools=True, review_rounds=2).run("Plan it"))
+    first, second = resp.reflection
+    assert first.shipped and not second.shipped
+    assert second.verdict.startswith("regressed")

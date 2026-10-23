@@ -86,8 +86,8 @@ flowchart LR
 5. **Summary refresh.** If anything changed, the executive summary is regenerated so it matches the revised body.
 6. **Anchored re-review.** From round 2, the reviewer first checks each previous issue (resolved or not) and only then raises new serious issues. Without this, an LLM reviewer moves the goalposts every round and scores aren't comparable. Every round reports `previous_issues_resolved`, e.g. `6/6`.
 7. **Regression guard.**
-   - A revision that drops a table, adds placeholders or loses half its content is rejected.
-   - Every reviewed version is snapshotted; if a later round scores clearly worse, the best version is shipped. LLM-judge scores wobble by about a point, so a 1-point dip alone doesn't undo real fixes.
+   - A revision or regeneration that drops a table, empties a section, adds placeholders or loses half its content is rejected. This was seen live: a regenerated summary came back as valid JSON with 0 words. Empty or table-less first drafts are retried on the spot.
+   - Every reviewed version is snapshotted. If a later round scores clearly worse, or ties but has more high-severity issues, the best version is shipped. LLM-judge scores wobble by about a point, so a 1-point dip alone doesn't undo real fixes.
 8. **Bounded.** A draft passes with no high or medium issues (or 9/10+ with no high issues); otherwise up to 3 review rounds.
 
 **Why I chose it.** In a document agent, the most common failure isn't a crash. It's a document that looks
@@ -95,14 +95,14 @@ complete but quietly drops a requirement, contradicts itself (a $48k budget in o
 or leaves placeholders. You only find those after sending it. Reflection targets output quality, which is
 what the user actually judges, and it makes that quality measurable.
 
-**How it improves the agent: results from the runs in [`examples/`](examples/).** These two runs predate the tool-calling feature.
+**How it improves the agent: results from the runs in [`examples/`](examples/)** (generated with tools on).
 
 | Test | Review scores | What the reviewer caught and the agent fixed |
 |---|---|---|
-| Standard | **5/10 → 9/10**, 6/6 issues resolved | A milestone whose start date was after its end date, inconsistent milestone dates, team members not in the fact sheet, an executive summary quoting the wrong dates |
-| Complex | **9/10** first pass | Passed straight away: the conflict decisions from the analysis step were applied consistently |
+| Standard | **8/10 → 7/10 → 9/10**, 2/2 then 2/2 issues resolved | A risk mitigation adding a $5,000 contingency and a 1-week buffer that the fixed 8-week plan didn't allow, a satisfaction survey scheduled after the project ended, then an extra $3,000 missing from the $120,000 budget and a support window running past the end date |
+| Complex | **8/10 → 5/10 → 9/10**, 1/1 resolved in the final round | A resource plan too thin to be useful (73 words, caught by the code checks), then an executive summary too long for a one-page board brief. The dip in round 2 is the anchored re-review flagging a new high-severity problem, not a regression |
 
-Other development runs of the complex request (5/10 → 9/10 twice) showed the same mechanism on harder failures: arithmetic errors in a budget table
+Earlier development runs of the complex request (5/10 → 9/10 twice) showed the same mechanism on harder failures: arithmetic errors in a budget table
 ("28% cheaper" that was actually 72%), a hiring budget double-counted across two sections, an empty table,
 and a summary stating "€200k approved" when the request said it was only possible. One run
 regressed after revision (8 → 8 → 7) and the guard shipped the best version.
@@ -173,10 +173,11 @@ numbers. Raw results: [`examples/tool_eval.json`](examples/tool_eval.json).
 - **The model mis-added *inside* its own tool call.** gpt-oss-20b passed `(180000 - 55000)` when the items summed to 50,000. Hence the rule "pass raw numbers, never your own subtotals", and code verification as a backstop.
 - **A wrong fact sheet made the reviewer punish correct sections.** The analysis wrote "Wednesday 21 Dec 2026" (a Monday). Code fixed the sections, then the reviewer flagged them for contradicting the fact sheet; that run scored 6, against 8 with tools off. The fact sheet is now verified before anything uses it.
 - **The verifier corrupted a correct-looking table.** It rewrote "Total Committed: 50,000" as the sum of *all* rows (200,000). That's why the auto-fix vs. flag split exists, with this exact table as a regression test. The model's real mistake there was that the committed rows summed to 20,000, and that is now what gets flagged.
+- **Live example in the saved complex run:** the analysis wrote "Fri 15 Dec 2026" (a Tuesday) into the fact sheet; code fixed it before any section copied it.
 - **Groq-specific failure modes:** "Tool choice is none, but model called a tool" and "Parsing failed" 400s are now retryable bad outputs rather than dead endpoints.
 - **Quota exhaustion produced an empty document.** A live run with the daily token cap nearly spent returned HTTP 200 with a 0-section document, because every task failed instantly. Now the client raises a dedicated rate-limit error, the agent aborts the first draft, and the API returns `503` with a `Retry-After` header and a plain message ("try again in about 10 minutes").
 
-**Tests.** `pytest` runs 24 offline tests in under a second: tools, verifier, the tool loop against a mocked
+**Tests.** `pytest` runs 26 offline tests in under a second: tools, verifier, the tool loop against a mocked
 Groq API (tool turns, budget nudge, 400 recovery, 429s), and a full agent run with a scripted fake LLM that plants
 the real-world errors above and checks each one is fixed or sent to the reviser.
 
@@ -193,12 +194,12 @@ The complex request is deliberately ambiguous ("something"), conflicting (one pa
 €50k vs. €200k, Christmas vs. Q2) and incomplete (no countries, no company or competitor names). In the
 saved run the agent:
 
-- chose a **Board Briefing** with 6 sections, front-loading a recommendation;
+- chose a **Board Briefing** with 6 sections, opening with "Executive Summary & Recommendation";
 - resolved each conflict with a stated rationale:
-  - **Budget:** €50k as a lean MVP baseline vs. €200k full scale, as an explicit board decision.
-  - **Timeline:** legal's Q2 2027 date becomes the hard stop for public launch, with an internal soft launch in Q4 2026 for sales.
-  - **Countries:** phased rollout starting with Germany and France.
-- listed the open questions for the board (company and competitor names, hiring budget, vendor stack) instead of stalling.
+  - **Budget:** €50,000 as the committed pilot baseline, and €200,000 as the maximum the board may approve for the full rollout.
+  - **Timeline:** two scenarios. Sales' pre-Christmas 2026 target is flagged as non-compliant, and a compliant Q2 launch on 30 May 2027 is recommended.
+  - **Countries:** Germany, France and Spain as a provisional first trio.
+- listed the open questions for the board (priority countries, cost breakdown, hiring numbers, competitor names, how to split the budget) instead of stalling.
 
 All of this lands in the document's *Assumptions, Decisions & Open Questions* appendix and in the `analysis`
 block of the response.
@@ -220,21 +221,21 @@ Response (abridged; full examples in `examples/*_response.json`):
 ```json
 {
   "status": "success",
-  "message": "Generated a 7-section Project Plan \"…\" (~1555 words) for … Self-review score 5/10 → 9/10 after revising 2 section(s).",
-  "document": { "filename": "…docx", "download_url": "http://localhost:8000/documents/…docx", "sections": ["…"], "word_count": 1555 },
+  "message": "Generated a 7-section Project Plan \"…\" (~1695 words) for … Self-review score 8/10 → 7/10 → 9/10 after revising 6 section(s).",
+  "document": { "filename": "…docx", "download_url": "http://localhost:8000/documents/…docx", "sections": ["…"], "word_count": 1695 },
   "key_points": ["…"],
   "analysis": { "document_type": "Project Plan", "explicit_requirements": [], "conflicts": [], "assumptions": [], "missing_information": [], "key_facts": [] },
   "quality_score": 9,
   "plan_rationale": "…",
   "todo": [{ "id": "T3", "title": "Timeline with Milestones", "action": "build_table", "status": "revised", "duration_s": 2.4 }],
   "reflection": [
-    { "round": 1, "score": 5, "verdict": "revise", "issues": [{ "section_id": "T3", "severity": "high", "category": "dates", "problem": "…", "fix": "…" }], "revised_sections": ["…"] },
-    { "round": 2, "score": 9, "verdict": "pass", "previous_issues_resolved": "6/6", "shipped": true }
+    { "round": 1, "score": 8, "verdict": "revise", "issues": [{ "section_id": "T7", "severity": "medium", "category": "dates", "problem": "…", "fix": "…" }], "revised_sections": ["…"] },
+    { "round": 3, "score": 9, "verdict": "pass", "previous_issues_resolved": "2/2", "shipped": true }
   ],
-  "checks": { "tools_enabled": true, "tool_calls": { "calculate": 5, "project_calendar": 2 }, "first_draft_errors": 1, "fact_sheet_errors": 0,
-              "totals_checked": 9, "corrections": ["[T5] 'Total' / 'Cost (€)': €50,000 -> €45,000 (sum of line items)"] },
-  "usage": { "llm_calls": 36, "prompt_tokens": 0, "completion_tokens": 0, "retries": 0, "fallbacks": 0, "models_used": {} },
-  "elapsed_s": 209.2
+  "checks": { "tools_enabled": true, "tool_calls": { "calculate": 9, "project_calendar": 5, "date_add": 4, "percentage": 2 }, "first_draft_errors": 0,
+              "fact_sheet_errors": 1, "totals_checked": 0, "corrections": ["[fact sheet] weekday: 'Fri 15 Dec 2026' -> Tue (15 Dec 2026 is a Tuesday)"] },
+  "usage": { "llm_calls": 74, "prompt_tokens": 0, "completion_tokens": 0, "retries": 0, "fallbacks": 0, "models_used": {} },
+  "elapsed_s": 244.9
 }
 ```
 

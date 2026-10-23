@@ -280,6 +280,18 @@ def _data_table(doc, table: TableData, number: int):
     lengths = [max([len(c)] + [len(r[i]) for r in table.rows]) for i, c in enumerate(cols)]
     weights = [min(max(n, 6), 45) for n in lengths]
     widths = [int(TEXT_WIDTH * w / sum(weights)) for w in weights]
+    # No column narrower than its longest word (so "Competitor" never breaks mid-word); the space comes
+    # proportionally from the columns that have room to spare.
+    longest_word = [max(len(w) for cell in [c] + [r[i] for r in table.rows] for w in (cell.split() or [""]))
+                    for i, c in enumerate(cols)]
+    mins = [int(Cm(0.2) * n + Cm(0.45)) for n in longest_word]
+    deficit = sum(max(0, m - w) for m, w in zip(mins, widths))
+    if deficit:
+        spare = {i: w - m for i, (w, m) in enumerate(zip(widths, mins)) if w > m}
+        widths = [max(w, m) for w, m in zip(widths, mins)]
+        for i, room in spare.items():
+            widths[i] -= int(min(deficit, sum(spare.values())) * room / sum(spare.values()))
+        widths = [int(w * TEXT_WIDTH / sum(widths)) for w in widths]  # still fits the page
 
     header = t.rows[0]
     trpr = header._tr.get_or_add_trPr()
