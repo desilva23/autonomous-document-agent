@@ -91,3 +91,19 @@ def test_quota_exhaustion_raises_rate_limited_error_with_retry_after():
     with pytest.raises(RateLimitedError) as err:
         asyncio.run(client.json("Reply with JSON.", "hi", Total, UsageStats()))
     assert 620 < err.value.retry_after <= 626
+
+
+def test_rate_limits_are_quiet_but_counted(caplog):
+    caplog.set_level("INFO", logger="agent.llm")
+    _, stats, _ = run([(429, {"error": {"message": "rate limited"}}), (200, answer('{"total": 1}'))])
+    assert stats.rate_limit_wait_s > 0
+    assert not [r for r in caplog.records if "rate limit" in r.getMessage()]  # DEBUG only
+
+
+def test_tool_arguments_are_logged_in_parameter_order(caplog):
+    caplog.set_level("INFO", logger="agent.llm")
+    client = LLMClient([])
+    client._run_tool({"id": "x", "function": {"name": "days_between",
+                                              "arguments": '{"end_date": "2026-12-26", "start_date": "2026-11-01"}'}},
+                     UsageStats())
+    assert "days_between(2026-11-01, 2026-12-26)" in caplog.records[-1].getMessage()

@@ -1,5 +1,6 @@
 """FastAPI entry point: POST /agent turns a natural-language request into a Word document."""
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -12,7 +13,9 @@ from .config import settings
 from .llm import LLMClient, LLMError, RateLimitedError, build_endpoints
 from .schemas import AgentRequest, AgentResponse
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
+# LOG_LEVEL=DEBUG also shows every rate-limit wait and model switch (hidden by default to keep the log readable).
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)-7s %(message)s",
+                    datefmt="%H:%M:%S")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("agent")
 

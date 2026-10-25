@@ -12,6 +12,7 @@ Prevention complements that detection: the model calls deterministic tools
 (calculator, calendar) while it writes, and `verify.py` recomputes every table
 total and weekday after each write, fixing them in code.
 """
+import asyncio
 import logging
 import re
 import time
@@ -71,10 +72,13 @@ class Run:
     @contextmanager
     def track(self, item: TodoItem):
         item.status = "running"
-        t0 = time.perf_counter()
+        t0, waited0 = time.perf_counter(), self.stats.rate_limit_wait_s
         log.info("▶ [%s] %-17s %s", item.id, item.action, item.title)
         try:
             yield item
+        except asyncio.CancelledError:  # server stopped (Ctrl+C) mid-request
+            item.status, item.detail = "failed", "cancelled"
+            raise
         except Exception as e:
             item.status = "failed"
             item.detail = item.detail or str(e)[:200]
@@ -84,9 +88,11 @@ class Run:
                 item.status = "done"
         finally:
             item.duration_s = round(time.perf_counter() - t0, 2)
+            waited = self.stats.rate_limit_wait_s - waited0
             mark = "✔" if item.status in ("done", "revised") else "✖"
-            log.info("%s [%s] %s in %.1fs%s", mark, item.id, item.status, item.duration_s,
-                     f" — {item.detail}" if item.detail else "")
+            log.info("%s [%s] %s in %.1fs%s%s", mark, item.id, item.status, item.duration_s,
+                     f" — {item.detail}" if item.detail else "",
+                     f" · waited {waited:.0f}s for rate limits" if waited >= 1 else "")
 
 
 class DocumentAgent:
@@ -430,7 +436,8 @@ class DocumentAgent:
                               fact_sheet_errors=run.fact_sheet_errors,
                               totals_checked=run.totals_checked, corrections=run.corrections),
             usage=UsageInfo(llm_calls=s.calls, prompt_tokens=s.prompt_tokens, completion_tokens=s.completion_tokens,
-                            retries=s.retries, fallbacks=s.fallbacks, models_used=s.models_used),
+                            retries=s.retries, fallbacks=s.fallbacks, models_used=s.models_used,
+                            rate_limit_wait_s=round(s.rate_limit_wait_s, 1)),
             elapsed_s=round(time.perf_counter() - run.started, 1),
         )
 

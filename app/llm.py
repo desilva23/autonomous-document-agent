@@ -29,6 +29,7 @@ from .tools import TOOL_SPECS, run_tool
 log = logging.getLogger("agent.llm")
 T = TypeVar("T", bound=BaseModel)
 MAX_TOOL_TURNS = 3
+_PARAMS = {t["function"]["name"]: t["function"]["parameters"]["properties"] for t in TOOL_SPECS}
 _FINAL_NUDGE = {"role": "user", "content": "You now have every tool result you need. Do not call any more tools: "
                                            "reply with the final JSON object only."}
 
@@ -54,6 +55,7 @@ class UsageStats:
     fallbacks: int = 0
     models_used: dict[str, int] = field(default_factory=dict)
     tool_calls: dict[str, int] = field(default_factory=dict)
+    rate_limit_wait_s: float = 0.0  # time spent waiting on provider rate limits
 
 
 class LLMError(RuntimeError):
@@ -158,10 +160,12 @@ class LLMClient:
                 raise RateLimitedError(f"All models are rate limited; the soonest frees up in {wait:.0f}s "
                                        f"({ep.name})", retry_after=wait)
             if wait > 0:
-                log.warning("  waiting %.1fs for %s rate limit", wait, ep.name)
+                # Rate-limit handling is routine on the free tier: logged at DEBUG, summed into the task's done line.
+                log.debug("  waiting %.1fs for %s rate limit", wait, ep.name)
+                stats.rate_limit_wait_s += wait
                 await asyncio.sleep(wait)
             if ep.name != last and (last or ep.model != prefer):
-                log.warning("  ↪ using %s", ep.name)
+                log.debug("  ↪ using %s", ep.name)
             last = ep.name
 
             raw = ""
@@ -187,7 +191,7 @@ class LLMClient:
                 self._cool_until[ep.name] = time.monotonic() + e.wait
                 stats.retries += 1
                 errors.append(f"{ep.name}: {e}")
-                log.warning("  %s rate limited (%.1fs)", ep.name, e.wait)
+                log.debug("  %s rate limited (%.1fs)", ep.name, e.wait)
                 continue
             except (_BadOutput, ValueError, ValidationError) as e:
                 errors.append(f"{ep.name}: invalid output ({_short(e)})")
@@ -236,7 +240,9 @@ class LLMClient:
             shown = f"{len(result['weeks'])} weeks, ends {result['end']}"
         else:
             shown = result
-        log.info("    🔧 %s(%s) → %s", name, ", ".join(f"{v}" for v in args.values())[:70], str(shown)[:90])
+        order = list(_PARAMS.get(name, ()))  # show arguments in the tool's own order (start before end)
+        shown_args = ", ".join(str(args[k]) for k in sorted(args, key=lambda k: order.index(k) if k in order else 99))
+        log.info("    🔧 %s(%s) → %s", name, shown_args[:70], str(shown)[:90])
         return json.dumps(result)
 
     async def _chat(self, ep: Endpoint, messages, temperature, max_tokens, effort, stats: UsageStats,

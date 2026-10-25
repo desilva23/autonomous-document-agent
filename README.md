@@ -21,7 +21,7 @@ uvicorn app.main:app --port 8000
 ```
 
 Open **http://localhost:8000/docs** → `POST /agent` → *Try it out* → pick the `standard` or `complex` example → *Execute*.
-Watch the terminal: the agent prints its TODO list, each task as it runs, and every review round.
+Watch the terminal: the agent prints its TODO list, each task as it runs (with any time spent waiting on free-tier rate limits), its calculator/calendar calls, and every review round.
 The JSON response contains a `download_url` for the document.
 
 ```bash
@@ -234,7 +234,7 @@ Response (abridged; full examples in `examples/*_response.json`):
   ],
   "checks": { "tools_enabled": true, "tool_calls": { "calculate": 9, "project_calendar": 5, "date_add": 4, "percentage": 2 }, "first_draft_errors": 0,
               "fact_sheet_errors": 1, "totals_checked": 0, "corrections": ["[fact sheet] weekday: 'Fri 15 Dec 2026' -> Tue (15 Dec 2026 is a Tuesday)"] },
-  "usage": { "llm_calls": 74, "prompt_tokens": 0, "completion_tokens": 0, "retries": 0, "fallbacks": 0, "models_used": {} },
+  "usage": { "llm_calls": 74, "prompt_tokens": 0, "completion_tokens": 0, "retries": 0, "fallbacks": 0, "models_used": {}, "rate_limit_wait_s": 38.5 },
   "elapsed_s": 244.9
 }
 ```
@@ -275,6 +275,7 @@ outputs/            Generated documents
 | `AGENT_QUALITY_THRESHOLD` | `8` | Score a clean draft needs to pass |
 | `LLM_MAX_RATE_LIMIT_WAIT` | `2` | Seconds to wait for the preferred model before using another |
 | `AGENT_TOOLS` | `true` | Calculator/calendar tool calling and table/date verification |
+| `LOG_LEVEL` | `INFO` | `DEBUG` also shows every rate-limit wait and model switch; at `INFO` each task line just notes the total wait |
 
 ## Trade-offs and next steps
 

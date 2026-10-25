@@ -308,6 +308,7 @@ class UsageInfo(BaseModel):
     retries: int
     fallbacks: int
     models_used: dict[str, int]
+    rate_limit_wait_s: float = 0.0
 
 
 class AgentResponse(BaseModel):
